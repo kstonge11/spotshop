@@ -19,3 +19,14 @@ npm-debug.log*
 # Editor
 .vscode/
 .idea/
+
+node_modules/
+.env
+.env.local
+.DS_Store
+.idea/
+dist/
+*.log
+*.zip
+client.zip
+server.zip
