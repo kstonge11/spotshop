@@ -153,7 +153,7 @@ app.get("/api/playlists/:id/tracks", requireAuth, async (req, res) => {
   try {
     const { limit = 50, offset = 0 } = req.query;
     const data = await spotifyGet(
-      `/playlists/${req.params.id}/tracks?limit=${limit}&offset=${offset}&fields=items(track(name,artists,album(name,images),external_urls,duration_ms)),next,total`,
+      `/playlists/${req.params.id}/tracks?limit=${limit}&offset=${offset}&fields=items(track(id,name,artists,album(name,images),external_urls,duration_ms,preview_url)),next,total`,
       req.session.access_token
     );
     res.json(data);
@@ -169,6 +169,105 @@ app.get("/api/playlists/:id", requireAuth, async (req, res) => {
       req.session.access_token
     );
     res.json(data);
+  } catch (err) {
+    handleSpotifyError(err, res);
+  }
+});
+
+// Batch audio features — tries Spotify first, falls back to RapidAPI
+const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY || "";
+const RAPIDAPI_HOST = "spotify-extended-audio-features-api.p.rapidapi.com";
+
+async function fetchAudioFeaturesFromRapidAPI(ids) {
+  // RapidAPI endpoint only allows 5 IDs per request
+  const chunks = [];
+  for (let i = 0; i < ids.length; i += 5) {
+    chunks.push(ids.slice(i, i + 5));
+  }
+  const allFeatures = [];
+  for (const chunk of chunks) {
+    try {
+      const resp = await axios.get(
+        `https://${RAPIDAPI_HOST}/v1/audio-features?ids=${chunk.join(",")}`,
+        {
+          headers: {
+            "x-rapidapi-key": RAPIDAPI_KEY,
+            "x-rapidapi-host": RAPIDAPI_HOST,
+          },
+        }
+      );
+      allFeatures.push(...(resp.data.audio_features || []));
+    } catch (err) {
+      if (err.response?.status === 429) {
+        // Wait and retry once
+        await new Promise((r) => setTimeout(r, 1200));
+        const retry = await axios.get(
+          `https://${RAPIDAPI_HOST}/v1/audio-features?ids=${chunk.join(",")}`,
+          {
+            headers: {
+              "x-rapidapi-key": RAPIDAPI_KEY,
+              "x-rapidapi-host": RAPIDAPI_HOST,
+            },
+          }
+        );
+        allFeatures.push(...(retry.data.audio_features || []));
+      } else {
+        throw err;
+      }
+    }
+    // Small delay between requests to stay under rate limit
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return { audio_features: allFeatures };
+}
+
+app.get("/api/audio-features", requireAuth, async (req, res) => {
+  try {
+    const { ids } = req.query;
+    if (!ids) return res.json({ audio_features: [] });
+
+    const allIds = ids.split(",").filter(Boolean);
+    const chunks = [];
+    for (let i = 0; i < allIds.length; i += 100) {
+      chunks.push(allIds.slice(i, i + 100));
+    }
+
+    let audio_features = [];
+
+    // Try Spotify first
+    try {
+      const results = await Promise.all(
+        chunks.map((chunk) =>
+          spotifyGet(
+            `/audio-features?ids=${chunk.join(",")}`,
+            req.session.access_token
+          )
+        )
+      );
+      audio_features = results.flatMap((r) => r.audio_features || []);
+    } catch (spotifyErr) {
+      const status = spotifyErr.response?.status;
+      // If 403 (restricted), fall back to RapidAPI
+      if (status === 403 && RAPIDAPI_KEY) {
+        console.log("Spotify audio-features returned 403, falling back to RapidAPI...");
+        try {
+          const results = await Promise.all(
+            chunks.map((chunk) => fetchAudioFeaturesFromRapidAPI(chunk))
+          );
+          audio_features = results.flatMap((r) => r.audio_features || []);
+        } catch (rapidErr) {
+          console.error("RapidAPI fallback failed:", rapidErr.response?.data || rapidErr.message);
+          throw rapidErr;
+        }
+      } else if (status === 403 && !RAPIDAPI_KEY) {
+        console.log("Spotify audio-features returned 403 and no RAPIDAPI_KEY configured.");
+        return res.json({ audio_features: [], error: "audio_features_restricted" });
+      } else {
+        throw spotifyErr;
+      }
+    }
+
+    res.json({ audio_features });
   } catch (err) {
     handleSpotifyError(err, res);
   }
